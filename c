@@ -66,6 +66,8 @@ case "$cmd" in
     [[ -z "$account" ]] && { echo "Usage: c --add <name>"; exit 1; }
     adir=$(_account_dir "$account")
     mkdir -p "$adir"
+    ln -sf "$HOME/.claude/settings.json" "$adir/settings.json"
+    ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
     CLAUDE_CONFIG_DIR="$adir" claude auth login
     _register "$account"
     echo "Account '$account' ready."
