@@ -1,6 +1,6 @@
 # clauDo
 
-Multi-account [Claude Code](https://claude.ai/code) launcher. Switch between Claude accounts per project, with shared config via symlinks.
+Multi-account [Claude Code](https://claude.ai/code) launcher. Tested on macOS. Switch between Claude accounts per project, with shared config via symlinks.
 
 ## How it works
 
