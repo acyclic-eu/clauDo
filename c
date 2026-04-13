@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# Claude launcher — named accounts with API keys in macOS Keychain
+# Claude launcher — named accounts with per-account config dirs
 #
-# c --add <name>      store an API key for an account
+# c --add <name>      log in and store an account (browser OAuth)
 # c --list            list accounts (* = default)
 # c --default <name>  set default account
 # c --whoami          show active account + email
 # c --account <name>  use a specific account (persists to .claude-account)
-# c [args]            resolve account, inject key, launch claude
+# c [args]            resolve account, set config dir, launch claude
 
 CONF_DIR="$HOME/.config/claude-accounts"
 ACCOUNTS_FILE="$CONF_DIR/accounts"
 DEFAULT_FILE="$CONF_DIR/default"
-KEYCHAIN_SERVICE="claude-code"
 
-_keychain_set()  { security add-generic-password -U -a "$1" -s "$KEYCHAIN_SERVICE" -w "$2"; }
-_keychain_get()  { security find-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null; }
-_keychain_del()  { security delete-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" 2>/dev/null; }
+_account_dir() { echo "$CONF_DIR/$1"; }
 
 _register() {
   mkdir -p "$CONF_DIR"
@@ -26,13 +23,11 @@ _register() {
 _resolve_account() {
   local account=""
   # 1. Walk up for .claude-account
-  if [[ -z "$account" ]]; then
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-      [[ -f "$dir/.claude-account" ]] && { account=$(< "$dir/.claude-account"); break; }
-      dir=$(dirname "$dir")
-    done
-  fi
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    [[ -f "$dir/.claude-account" ]] && { account=$(< "$dir/.claude-account"); break; }
+    dir=$(dirname "$dir")
+  done
   # 2. Global default
   [[ -z "$account" && -f "$DEFAULT_FILE" ]] && account=$(< "$DEFAULT_FILE")
   # 3. Prompt
@@ -55,27 +50,29 @@ _resolve_account() {
 account="" cmd="" passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --add)      cmd=add;     account="$2"; shift 2 ;;
-    --remove)   cmd=remove;  account="$2"; shift 2 ;;
-    --default)  cmd=default; account="$2"; shift 2 ;;
-    --list)     cmd=list;    shift ;;
-    --whoami)   cmd=whoami;  shift ;;
-    --account)  account="$2"; shift 2 ;;
+    --add)       cmd=add;     account="$2"; shift 2 ;;
+    --remove)    cmd=remove;  account="$2"; shift 2 ;;
+    --default)   cmd=default; account="$2"; shift 2 ;;
+    --list)      cmd=list;    shift ;;
+    --whoami)    cmd=whoami;  shift ;;
+    --account)   account="$2"; shift 2 ;;
     --account=*) account="${1#--account=}"; shift ;;
-    *)          passthrough+=("$1"); shift ;;
+    *)           passthrough+=("$1"); shift ;;
   esac
 done
 
 case "$cmd" in
   add)
     [[ -z "$account" ]] && { echo "Usage: c --add <name>"; exit 1; }
-    read -rsp "API key for '$account': " key; echo
-    _keychain_set "$account" "$key"
+    adir=$(_account_dir "$account")
+    mkdir -p "$adir"
+    CLAUDE_CONFIG_DIR="$adir" claude auth login
     _register "$account"
-    echo "Account '$account' stored in Keychain."
+    echo "Account '$account' ready."
     ;;
   remove)
-    _keychain_del "$account"
+    adir=$(_account_dir "$account")
+    rm -rf "$adir"
     sed -i '' "/^${account}$/d" "$ACCOUNTS_FILE" 2>/dev/null
     echo "Account '$account' removed."
     ;;
@@ -91,17 +88,16 @@ case "$cmd" in
     ;;
   whoami)
     account=$(_resolve_account)
-    key=$(_keychain_get "$account")
-    [[ -z "$key" ]] && { echo "No key for '$account'"; exit 1; }
-    echo -n "[$account] "
-    ANTHROPIC_API_KEY="$key" claude auth status \
-      | python3 -c "import sys,json; print(json.load(sys.stdin)['email'])"
+    adir=$(_account_dir "$account")
+    email=$(CLAUDE_CONFIG_DIR="$adir" claude auth status 2>/dev/null \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('email','unknown'))" 2>/dev/null)
+    echo "[$account] $email"
     ;;
   *)
     [[ -n "$account" ]] && echo "$account" > "$PWD/.claude-account"
     account=$(_resolve_account)
-    key=$(_keychain_get "$account")
-    [[ -z "$key" ]] && { echo "No key for '$account'. Run: c --add $account"; exit 1; }
-    ANTHROPIC_API_KEY="$key" exec claude "${passthrough[@]}"
+    adir=$(_account_dir "$account")
+    [[ ! -d "$adir" ]] && { echo "No config for '$account'. Run: c --add $account"; exit 1; }
+    CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
     ;;
 esac
