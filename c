@@ -1,178 +1,107 @@
 #!/usr/bin/env bash
-# Claude Code launcher — multi-account with per-project config
+# Claude launcher — named accounts with API keys in macOS Keychain
 #
-# Account resolution order:
-#   1. --account <name> flag
-#   2. .claude-account file (walks up from current dir)
-#   3. ~/.config/claude-accounts/default
-#   4. Interactive prompt (fzf if available, else select)
-#
-# To set a per-project account:
-#   echo personal > .claude-account
+# c --add <name>      store an API key for an account
+# c --list            list accounts (* = default)
+# c --default <name>  set default account
+# c --whoami          show active account + email
+# c --account <name>  use a specific account (persists to .claude-account)
+# c [args]            resolve account, inject key, launch claude
 
 CONF_DIR="$HOME/.config/claude-accounts"
 ACCOUNTS_FILE="$CONF_DIR/accounts"
 DEFAULT_FILE="$CONF_DIR/default"
-SHARED_DIR="$HOME/.claude"
+KEYCHAIN_SERVICE="claude-code"
 
-# Items to symlink from SHARED_DIR into new account dirs
-SHARED_ITEMS=(settings.json CLAUDE.md commands plugins)
+_keychain_set()  { security add-generic-password -U -a "$1" -s "$KEYCHAIN_SERVICE" -w "$2"; }
+_keychain_get()  { security find-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null; }
+_keychain_del()  { security delete-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" 2>/dev/null; }
+
+_register() {
+  mkdir -p "$CONF_DIR"
+  grep -qx "$1" "$ACCOUNTS_FILE" 2>/dev/null || echo "$1" >> "$ACCOUNTS_FILE"
+  [[ -f "$DEFAULT_FILE" ]] || echo "$1" > "$DEFAULT_FILE"
+}
+
+_resolve_account() {
+  local account=""
+  # 1. Walk up for .claude-account
+  if [[ -z "$account" ]]; then
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+      [[ -f "$dir/.claude-account" ]] && { account=$(< "$dir/.claude-account"); break; }
+      dir=$(dirname "$dir")
+    done
+  fi
+  # 2. Global default
+  [[ -z "$account" && -f "$DEFAULT_FILE" ]] && account=$(< "$DEFAULT_FILE")
+  # 3. Prompt
+  if [[ -z "$account" ]]; then
+    mapfile -t accounts < "$ACCOUNTS_FILE" 2>/dev/null
+    (( ${#accounts[@]} == 0 )) && { echo "No accounts. Run: c --add <name>"; exit 1; }
+    (( ${#accounts[@]} == 1 )) && account="${accounts[0]}"
+    if [[ -z "$account" ]]; then
+      if command -v fzf &>/dev/null; then
+        account=$(printf '%s\n' "${accounts[@]}" | fzf --prompt="Claude account: " --height=~10)
+      else
+        select acc in "${accounts[@]}"; do [[ -n "$acc" ]] && account="$acc" && break; done
+      fi
+    fi
+  fi
+  echo "$account"
+}
 
 # --- Parse flags ---
-
-account=""
-whoami_mode=false
-add_mode=false
-list_mode=false
-no_symlink=false
-passthrough_args=()
-
+account="" cmd="" passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --account)
-      account="$2"
-      shift 2
-      ;;
-    --account=*)
-      account="${1#--account=}"
-      shift
-      ;;
-    --add)
-      add_mode=true
-      account="$2"
-      shift 2
-      ;;
-    --list)
-      list_mode=true
-      shift
-      ;;
-    --whoami)
-      whoami_mode=true
-      shift
-      ;;
-    --no-symlink)
-      no_symlink=true
-      shift
-      ;;
-    *)
-      passthrough_args+=("$1")
-      shift
-      ;;
+    --add)      cmd=add;     account="$2"; shift 2 ;;
+    --remove)   cmd=remove;  account="$2"; shift 2 ;;
+    --default)  cmd=default; account="$2"; shift 2 ;;
+    --list)     cmd=list;    shift ;;
+    --whoami)   cmd=whoami;  shift ;;
+    --account)  account="$2"; shift 2 ;;
+    --account=*) account="${1#--account=}"; shift ;;
+    *)          passthrough+=("$1"); shift ;;
   esac
 done
 
-# --- List accounts ---
-
-if [[ "$list_mode" == true ]]; then
-  default=$(cat "$DEFAULT_FILE" 2>/dev/null)
-  while IFS= read -r acc; do
-    if [[ "$acc" == "$default" ]]; then
-      echo "* $acc (default)"
-    else
-      echo "  $acc"
-    fi
-  done < "$ACCOUNTS_FILE"
-  exit 0
-fi
-
-# --- Helpers ---
-
-_setup_account_dir() {
-  local name="$1"
-  local dir="$HOME/.claude-$name"
-  mkdir -p "$dir"
-  for item in "${SHARED_ITEMS[@]}"; do
-    local src="$SHARED_DIR/$item"
-    [[ -e "$src" ]] || continue
-    [[ -e "$dir/$item" ]] && continue  # don't clobber existing
-    ln -s "$src" "$dir/$item"
-  done
-}
-
-_register_account() {
-  local name="$1"
-  mkdir -p "$CONF_DIR"
-  if ! grep -qx "$name" "$ACCOUNTS_FILE" 2>/dev/null; then
-    echo "$name" >> "$ACCOUNTS_FILE"
-  fi
-  # First registered account becomes the default
-  [[ -f "$DEFAULT_FILE" ]] || echo "$name" > "$DEFAULT_FILE"
-}
-
-# --- Handle --add ---
-
-if [[ "$add_mode" == true ]]; then
-  [[ -z "$account" ]] && { echo "Usage: c --add <name>"; exit 1; }
-  _setup_account_dir "$account"
-  _register_account "$account"
-  echo "$account" > "$PWD/.claude-account"
-  echo "Account '$account' ready at $HOME/.claude-$account"
-  exit 0
-fi
-
-# --- Resolve account ---
-
-# If --account was given explicitly, persist it
-[[ -n "$account" ]] && echo "$account" > "$PWD/.claude-account"
-
-# 1. Walk up directory tree for .claude-account
-if [[ -z "$account" ]]; then
-  dir="$PWD"
-  while [[ "$dir" != "/" ]]; do
-    if [[ -f "$dir/.claude-account" ]]; then
-      account=$(cat "$dir/.claude-account")
-      break
-    fi
-    dir=$(dirname "$dir")
-  done
-fi
-
-# 2. Global default
-if [[ -z "$account" ]] && [[ -f "$DEFAULT_FILE" ]]; then
-  account=$(cat "$DEFAULT_FILE")
-fi
-
-# 3. Prompt
-if [[ -z "$account" ]]; then
-  if [[ ! -f "$ACCOUNTS_FILE" ]]; then
-    echo "No accounts configured. Run: c --add <name>"
-    exit 1
-  fi
-
-  mapfile -t accounts < "$ACCOUNTS_FILE"
-
-  if [[ ${#accounts[@]} -eq 0 ]]; then
-    echo "No accounts in $ACCOUNTS_FILE"
-    exit 1
-  elif [[ ${#accounts[@]} -eq 1 ]]; then
-    account="${accounts[0]}"
-  elif command -v fzf &>/dev/null; then
-    account=$(printf '%s\n' "${accounts[@]}" | fzf --prompt="Claude account: " --height=~10)
-  else
-    echo "Select Claude account:"
-    select acc in "${accounts[@]}"; do
-      [[ -n "$acc" ]] && account="$acc" && break
-    done
-  fi
-fi
-
-[[ -z "$account" ]] && exit 1
-
-# --- Setup dir and register ---
-
-if [[ "$no_symlink" == false ]]; then
-  _setup_account_dir "$account"
-fi
-_register_account "$account"
-
-# --- whoami ---
-
-if [[ "$whoami_mode" == true ]]; then
-  # If running inside a Claude session, CLAUDE_CONFIG_DIR is already set — use it directly
-  config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude-$account}"
-  CLAUDE_CONFIG_DIR="$config_dir" claude auth status \
-    | python3 -c "import sys,json; e=json.load(sys.stdin)['email']; print('@' + e.split('@')[1].split('.')[0])"
-  exit $?
-fi
-
-CLAUDE_CONFIG_DIR="$HOME/.claude-$account" claude "${passthrough_args[@]}"
+case "$cmd" in
+  add)
+    [[ -z "$account" ]] && { echo "Usage: c --add <name>"; exit 1; }
+    read -rsp "API key for '$account': " key; echo
+    _keychain_set "$account" "$key"
+    _register "$account"
+    echo "Account '$account' stored in Keychain."
+    ;;
+  remove)
+    _keychain_del "$account"
+    sed -i '' "/^${account}$/d" "$ACCOUNTS_FILE" 2>/dev/null
+    echo "Account '$account' removed."
+    ;;
+  default)
+    echo "$account" > "$DEFAULT_FILE"
+    echo "Default set to '$account'."
+    ;;
+  list)
+    default=$(< "$DEFAULT_FILE" 2>/dev/null)
+    while IFS= read -r acc; do
+      [[ "$acc" == "$default" ]] && echo "* $acc" || echo "  $acc"
+    done < "$ACCOUNTS_FILE"
+    ;;
+  whoami)
+    account=$(_resolve_account)
+    key=$(_keychain_get "$account")
+    [[ -z "$key" ]] && { echo "No key for '$account'"; exit 1; }
+    echo -n "[$account] "
+    ANTHROPIC_API_KEY="$key" claude auth status \
+      | python3 -c "import sys,json; print(json.load(sys.stdin)['email'])"
+    ;;
+  *)
+    [[ -n "$account" ]] && echo "$account" > "$PWD/.claude-account"
+    account=$(_resolve_account)
+    key=$(_keychain_get "$account")
+    [[ -z "$key" ]] && { echo "No key for '$account'. Run: c --add $account"; exit 1; }
+    ANTHROPIC_API_KEY="$key" exec claude "${passthrough[@]}"
+    ;;
+esac
