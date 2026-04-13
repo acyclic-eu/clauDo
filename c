@@ -105,11 +105,15 @@ if [[ "$add_mode" == true ]]; then
   [[ -z "$account" ]] && { echo "Usage: c --add <name>"; exit 1; }
   _setup_account_dir "$account"
   _register_account "$account"
+  echo "$account" > "$PWD/.claude-account"
   echo "Account '$account' ready at $HOME/.claude-$account"
   exit 0
 fi
 
 # --- Resolve account ---
+
+# If --account was given explicitly, persist it
+[[ -n "$account" ]] && echo "$account" > "$PWD/.claude-account"
 
 # 1. Walk up directory tree for .claude-account
 if [[ -z "$account" ]]; then
