@@ -17,7 +17,7 @@ Account resolution order:
 ```sh
 c                        # launch Claude with resolved account
 c --account work         # explicit account
-c --add personal         # register + scaffold a new account
+c --add <name>           # register + scaffold a new account
 c --list                 # list all accounts (* = default)
 c --whoami               # print active account's email domain
 ```
@@ -32,15 +32,11 @@ echo work > .claude-account
 ```sh
 cp c ~/.local/bin/c
 chmod +x ~/.local/bin/c
-mkdir -p ~/.config/claude-accounts
-echo "personal" > ~/.config/claude-accounts/accounts
-echo "personal" > ~/.config/claude-accounts/default
 ```
 
-Then scaffold your accounts:
+Then add your first account — it becomes the default automatically:
 ```sh
-c --add personal
-c --add work
+c --add <your-account-name>
 ```
 
 ## Shared config

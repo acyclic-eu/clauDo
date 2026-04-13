@@ -91,9 +91,12 @@ _setup_account_dir() {
 
 _register_account() {
   local name="$1"
+  mkdir -p "$CONF_DIR"
   if ! grep -qx "$name" "$ACCOUNTS_FILE" 2>/dev/null; then
     echo "$name" >> "$ACCOUNTS_FILE"
   fi
+  # First registered account becomes the default
+  [[ -f "$DEFAULT_FILE" ]] || echo "$name" > "$DEFAULT_FILE"
 }
 
 # --- Handle --add ---
