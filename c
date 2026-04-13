@@ -68,6 +68,16 @@ case "$cmd" in
     mkdir -p "$adir"
     ln -sf "$HOME/.claude/settings.json" "$adir/settings.json"
     ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
+    if [[ -d "$adir/skills" && ! -L "$adir/skills" ]]; then
+      mv "$adir/skills/"* "$HOME/.claude/skills/" 2>/dev/null
+      rm -rf "$adir/skills"
+    fi
+    ln -s "$HOME/.claude/skills" "$adir/skills"
+    if [[ -d "$adir/plugins" && ! -L "$adir/plugins" ]]; then
+      mv "$adir/plugins/"* "$HOME/.claude/plugins/" 2>/dev/null
+      rm -rf "$adir/plugins"
+    fi
+    ln -s "$HOME/.claude/plugins" "$adir/plugins"
     CLAUDE_CONFIG_DIR="$adir" claude auth login
     _register "$account"
     echo "Account '$account' ready."
