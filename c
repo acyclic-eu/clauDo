@@ -6,6 +6,7 @@
 # c --default <name>  set default account
 # c --whoami          show active account + email
 # c --account <name>  use a specific account (persists to .claude-account)
+# c --temp <name>     use account for this session only (no .claude-account written)
 # c [args]            resolve account, set config dir, launch claude
 
 CONF_DIR="$HOME/.config/claude-accounts"
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --whoami)    cmd=whoami;  shift ;;
     --account)   account="$2"; shift 2 ;;
     --account=*) account="${1#--account=}"; shift ;;
+    --temp)      cmd=temp; account="$2"; shift 2 ;;
     *)           passthrough+=("$1"); shift ;;
   esac
 done
@@ -67,7 +69,6 @@ case "$cmd" in
     adir=$(_account_dir "$account")
     mkdir -p "$adir"
     ln -sf "$HOME/.claude/settings.json" "$adir/settings.json"
-    ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
     if [[ -d "$adir/skills" && ! -L "$adir/skills" ]]; then
       mv "$adir/skills/"* "$HOME/.claude/skills/" 2>/dev/null
       rm -rf "$adir/skills"
@@ -78,6 +79,7 @@ case "$cmd" in
       rm -rf "$adir/plugins"
     fi
     ln -s "$HOME/.claude/plugins" "$adir/plugins"
+    ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
     CLAUDE_CONFIG_DIR="$adir" claude auth login
     _register "$account"
     echo "Account '$account' ready."
@@ -105,11 +107,24 @@ case "$cmd" in
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('email','unknown'))" 2>/dev/null)
     echo "[$account] $email"
     ;;
+  temp)
+    [[ -z "$account" ]] && { echo "Usage: c --temp <name>"; exit 1; }
+    adir=$(_account_dir "$account")
+    if [[ ! -d "$adir" ]]; then
+      adir="$CONF_DIR/.tmp-$account"
+      mkdir -p "$adir"
+      ln -sf "$HOME/.claude/settings.json" "$adir/settings.json"
+      [[ ! -e "$adir/skills" ]] && ln -s "$HOME/.claude/skills" "$adir/skills"
+      [[ ! -e "$adir/plugins" ]] && ln -s "$HOME/.claude/plugins" "$adir/plugins"
+      ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
+    fi
+    C_ACCOUNT="$account" C_TEMP=1 CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
+    ;;
   *)
     [[ -n "$account" ]] && echo "$account" > "$PWD/.claude-account"
     account=$(_resolve_account)
     adir=$(_account_dir "$account")
     [[ ! -d "$adir" ]] && { echo "No config for '$account'. Run: c --add $account"; exit 1; }
-    CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
+    C_ACCOUNT="$account" CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
     ;;
 esac

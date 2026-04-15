@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+# Path (truncated)
+P=$(pwd | sed "s|$HOME|~|")
+[ ${#P} -gt 40 ] && P="...${P: -37}"
+
+# Git branch
+B=$(git branch --show-current 2>/dev/null)
+[ -n "$B" ] && P="${P}[${B}]"
+
+# Resolve account + config dir
+if [ -n "$C_ACCOUNT" ]; then
+  ACC="$C_ACCOUNT"
+  CDIR="${CLAUDE_CONFIG_DIR:-$HOME/.config/claude-accounts/$ACC}"
+else
+  dir=$(pwd); ACC=""
+  while [ "$dir" != "/" ]; do
+    [ -f "$dir/.claude-account" ] && { ACC=$(cat "$dir/.claude-account"); break; }
+    dir=$(dirname "$dir")
+  done
+  [ -z "$ACC" ] && ACC=$(cat "$HOME/.config/claude-accounts/default" 2>/dev/null)
+  CDIR="$HOME/.config/claude-accounts/$ACC"
+fi
+
+# Account suffix
+if [ -n "$ACC" ]; then
+  EMAIL=$(python3 -c "
+import json, sys
+try:
+  d = json.load(open('$CDIR/.claude.json'))
+  print(d.get('oauthAccount',{}).get('emailAddress',''))
+except: sys.exit(1)
+" 2>/dev/null)
+  DOM="${EMAIL##*@}"; DOM="${DOM%%.*}"
+  [ "${C_TEMP:-0}" = "1" ] && SEP="~/" || SEP="/"
+  echo "$P (${ACC}${SEP}@${DOM})"
+else
+  echo "$P"
+fi
