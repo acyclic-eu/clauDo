@@ -15,6 +15,147 @@ ACCOUNTS_FILE="$CONF_DIR/accounts"
 
 _account_dir() { echo "$CONF_DIR/$1"; }
 
+# Sync mcpServers bidirectionally between ~/.claude/.claude.json (canonical) and all profile .claude.json files.
+# Any profile can add servers via /mcp add; they get merged into the canonical on next launch.
+# Record mcpServers into ~/.claude/mcp-history.json (never removes entries).
+_mcp_history_update() {
+  local servers_json="$1"   # JSON string of mcpServers dict
+  local history="$HOME/.claude/mcp-history.json"
+  python3 - "$history" "$servers_json" <<'PYEOF'
+import json, sys
+from datetime import datetime, timezone
+
+history_path = sys.argv[1]
+servers      = json.loads(sys.argv[2])
+
+try:
+  with open(history_path) as f:
+    history = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+  history = {}
+
+now = datetime.now(timezone.utc).isoformat()
+for name, config in servers.items():
+  if name in history:
+    history[name]["lastSeen"] = now
+    history[name]["config"]   = config
+  else:
+    history[name] = {"config": config, "firstSeen": now, "lastSeen": now}
+
+with open(history_path, "w") as f:
+  json.dump(history, f, indent=2)
+PYEOF
+}
+
+# Push canonical mcpServers (~/.claude/.claude.json) to all profiles.
+_sync_mcp_push() {
+  local default_json="$HOME/.claude/.claude.json"
+  [[ ! -f "$default_json" ]] && return
+  python3 - "$default_json" "$CONF_DIR" <<'PYEOF'
+import json, os, sys
+
+default_path = sys.argv[1]
+conf_dir     = sys.argv[2]
+
+def load(p):
+  with open(p) as f: return json.load(f)
+def save(p, d):
+  with open(p, "w") as f: json.dump(d, f, indent=2)
+
+canonical = load(default_path).get("mcpServers", {})
+
+accounts_file = os.path.join(conf_dir, "accounts")
+if not os.path.exists(accounts_file):
+  sys.exit(0)
+with open(accounts_file) as f:
+  accounts = [l.strip() for l in f if l.strip()]
+
+for acc in accounts:
+  p = os.path.join(conf_dir, acc, ".claude.json")
+  if not os.path.exists(p): continue
+  d = load(p)
+  if d.get("mcpServers") != canonical:
+    d["mcpServers"] = canonical
+    save(p, d)
+PYEOF
+  # Record current canonical in history
+  local canonical
+  canonical=$(python3 -c "import json; d=json.load(open('$HOME/.claude/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" 2>/dev/null)
+  [[ -n "$canonical" ]] && _mcp_history_update "$canonical"
+}
+
+# After a session ends, diff the active profile's mcpServers against the before-snapshot.
+# Additions and removals are applied to canonical and all other profiles.
+_sync_mcp_diff() {
+  local profile_json="$1"
+  local snapshot="$2"
+  local default_json="$HOME/.claude/.claude.json"
+  [[ ! -f "$profile_json" || ! -f "$snapshot" || ! -f "$default_json" ]] && return
+  python3 - "$profile_json" "$snapshot" "$default_json" "$CONF_DIR" <<'PYEOF'
+import json, os, sys
+
+profile_path  = sys.argv[1]
+snapshot_path = sys.argv[2]
+default_path  = sys.argv[3]
+conf_dir      = sys.argv[4]
+
+def load(p):
+  with open(p) as f: return json.load(f)
+def save(p, d):
+  with open(p, "w") as f: json.dump(d, f, indent=2)
+
+before   = json.loads(open(snapshot_path).read())
+after    = load(profile_path).get("mcpServers", {})
+added    = {k: v for k, v in after.items()   if k not in before}
+removed  = {k     for k    in before.keys()  if k not in after}
+
+if not added and not removed:
+  sys.exit(0)
+
+accounts_file = os.path.join(conf_dir, "accounts")
+with open(accounts_file) as f:
+  accounts = [l.strip() for l in f if l.strip()]
+
+all_paths = [default_path] + [
+  os.path.join(conf_dir, acc, ".claude.json")
+  for acc in accounts
+  if os.path.exists(os.path.join(conf_dir, acc, ".claude.json"))
+]
+
+for p in all_paths:
+  if p == profile_path:
+    continue
+  d = load(p)
+  mcp = dict(d.get("mcpServers", {}))
+  for k, v in added.items():
+    mcp[k] = v
+  for k in removed:
+    mcp.pop(k, None)
+  d["mcpServers"] = mcp
+  save(p, d)
+
+# Also update canonical
+d = load(default_path)
+mcp = dict(d.get("mcpServers", {}))
+for k, v in added.items():
+  mcp[k] = v
+for k in removed:
+  mcp.pop(k, None)
+d["mcpServers"] = mcp
+save(default_path, d)
+
+if added:   print(f"MCP sync: added {list(added.keys())}")
+if removed: print(f"MCP sync: removed {list(removed)}")
+# Output added servers as JSON for history update
+print(f"__added_json__:{json.dumps(added)}")
+PYEOF
+  # Update history with the post-session state (history never removes entries)
+  local after_json
+  after_json=$(python3 -c "import json; d=json.load(open('$profile_json')); print(json.dumps(d.get('mcpServers',{})))" 2>/dev/null)
+  [[ -n "$after_json" ]] && _mcp_history_update "$after_json"
+  rm -f "$snapshot"
+}
+
 _register() {
   mkdir -p "$CONF_DIR"
   grep -qx "$1" "$ACCOUNTS_FILE" 2>/dev/null || echo "$1" >> "$ACCOUNTS_FILE"
@@ -135,6 +276,8 @@ case "$cmd" in
     fi
     ln -s "$HOME/.claude/plugins" "$adir/plugins"
     ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
+    [[ ! -e "$adir/projects" ]] && ln -s "$HOME/.claude/projects" "$adir/projects"
+    [[ ! -e "$adir/sessions" ]] && ln -s "$HOME/.claude/sessions" "$adir/sessions"
     CLAUDE_CONFIG_DIR="$adir" claude auth login
     _register "$account"
     echo "Account '$account' ready."
@@ -167,7 +310,11 @@ case "$cmd" in
       [[ ! -e "$adir/plugins" ]] && ln -s "$HOME/.claude/plugins" "$adir/plugins"
       ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
     fi
-    C_ACCOUNT="$account" C_TEMP=1 CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
+    _sync_mcp_push
+    snapshot=$(mktemp)
+    python3 -c "import json; d=json.load(open('$adir/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" > "$snapshot" 2>/dev/null
+    C_ACCOUNT="$account" C_TEMP=1 CLAUDE_CONFIG_DIR="$adir" claude "${passthrough[@]}"
+    _sync_mcp_diff "$adir/.claude.json" "$snapshot"
     ;;
   *)
     # Implicit account: c work  →  c --account work
@@ -182,9 +329,17 @@ case "$cmd" in
     if [[ -n "$account" ]]; then
       adir=$(_account_dir "$account")
       [[ ! -d "$adir" ]] && { echo "No config for '$account'. Run: c --add $account"; exit 1; }
-      C_ACCOUNT="$account" CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
+      _sync_mcp_push
+      snapshot=$(mktemp)
+      python3 -c "import json; d=json.load(open('$adir/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" > "$snapshot" 2>/dev/null
+      C_ACCOUNT="$account" CLAUDE_CONFIG_DIR="$adir" claude "${passthrough[@]}"
+      _sync_mcp_diff "$adir/.claude.json" "$snapshot"
     else
-      exec claude "${passthrough[@]}"
+      _sync_mcp_push
+      snapshot=$(mktemp)
+      python3 -c "import json; d=json.load(open('$HOME/.claude/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" > "$snapshot" 2>/dev/null
+      claude "${passthrough[@]}"
+      _sync_mcp_diff "$HOME/.claude/.claude.json" "$snapshot"
     fi
     ;;
 esac

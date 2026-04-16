@@ -4,7 +4,7 @@ Multi-account [Claude Code](https://claude.ai/code) launcher. Tested on macOS. S
 
 ## How it works
 
-Claude Code stores its config in `~/.claude/`. clauDo gives each account its own isolated directory (`~/.claude-<name>`) while symlinking shared config (settings, commands, CLAUDE.md) from a single source of truth.
+Claude Code stores its config in `~/.claude/`. clauDo gives each account its own isolated directory (`~/.config/claude-accounts/<name>/`) while symlinking shared config (settings, commands, CLAUDE.md) from a single source of truth.
 
 Account resolution order:
 1. `c <name>` positional arg or `--account <name>` flag
@@ -18,7 +18,7 @@ Account resolution order:
 c                        # launch Claude with resolved account
 c work                   # implicit account (shorthand for --account work)
 c -a <name>              # register + scaffold a new account (--add)
-c -l                     # list all accounts (* = default) (--list)
+c -l                     # list all accounts (--list)
 c -w                     # print active account's email (--whoami)
 c -t <name>              # use account for this session only (--temp)
 c -r <name>              # remove an account (--remove)
@@ -62,5 +62,18 @@ Items symlinked from `~/.claude/` into each account dir:
 - `CLAUDE.md`
 - `commands/`
 - `plugins/`
+- `skills/`
 
-`.claude.json` (MCP servers, auth) symlinks to `~/.claude.json`.
+## MCP server sync
+
+MCP servers are configured per-profile in each account's `.claude.json`. clauDo keeps them in sync across all profiles automatically.
+
+**Canonical source:** `~/.claude/.claude.json` — this is the source of truth for MCP servers.
+
+**On every `c` launch:**
+1. Canonical is pushed to all profiles before Claude starts.
+2. A snapshot of the active profile's MCP state is taken.
+3. After Claude exits, the snapshot is diffed against the new state.
+4. Any servers added or removed via `/mcp add` / `/mcp remove` during the session are propagated to canonical and all other profiles.
+
+**History:** Every MCP server ever seen is recorded in `~/.claude/mcp-history.json` with its full config and `firstSeen`/`lastSeen` timestamps. Use this to recover accidentally removed servers.
