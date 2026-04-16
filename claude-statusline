@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+BOLD='\033[1m'
+RED='\033[31m'
+RESET='\033[0m'
+
 # Path (truncated)
 P=$(pwd | sed "s|$HOME|~|")
 [ ${#P} -gt 40 ] && P="...${P: -37}"
@@ -8,10 +12,9 @@ P=$(pwd | sed "s|$HOME|~|")
 B=$(git branch --show-current 2>/dev/null)
 [ -n "$B" ] && P="${P}[${B}]"
 
-# Resolve account + config dir
+# Resolve account
 if [ -n "$C_ACCOUNT" ]; then
   ACC="$C_ACCOUNT"
-  CDIR="${CLAUDE_CONFIG_DIR:-$HOME/.config/claude-accounts/$ACC}"
 else
   dir=$(pwd); ACC=""
   while [ "$dir" != "/" ]; do
@@ -19,21 +22,36 @@ else
     dir=$(dirname "$dir")
   done
   [ -z "$ACC" ] && ACC=$(cat "$HOME/.config/claude-accounts/default" 2>/dev/null)
-  CDIR="$HOME/.config/claude-accounts/$ACC"
 fi
 
 # Account suffix
 if [ -n "$ACC" ]; then
-  EMAIL=$(python3 -c "
+  ACC_CDIR="$HOME/.config/claude-accounts/$ACC"
+  REAL_CDIR="${CLAUDE_CONFIG_DIR:-$HOME}"
+
+  get_dom() {
+    python3 -c "
 import json, sys
 try:
-  d = json.load(open('$CDIR/.claude.json'))
-  print(d.get('oauthAccount',{}).get('emailAddress',''))
+  d = json.load(open('$1/.claude.json'))
+  e = d.get('oauthAccount',{}).get('emailAddress','')
+  dom = e.split('@')[1].split('.')[0] if '@' in e else ''
+  print(dom)
 except: sys.exit(1)
-" 2>/dev/null)
-  DOM="${EMAIL##*@}"; DOM="${DOM%%.*}"
+" 2>/dev/null
+  }
+
+  ACC_DOM=$(get_dom "$ACC_CDIR")
+  REAL_DOM=$(get_dom "$REAL_CDIR")
+
   [ "${C_TEMP:-0}" = "1" ] && SEP="~/" || SEP="/"
-  echo "$P (${ACC}${SEP}@${DOM})"
+
+  if [ -n "$REAL_DOM" ] && [ "$ACC_DOM" != "$REAL_DOM" ]; then
+    echo -e "$P (${ACC}${SEP}${RED}@${REAL_DOM}${RESET})"
+  else
+    DOM="${ACC_DOM:-${REAL_DOM}}"
+    echo "$P (${ACC}${SEP}@${DOM})"
+  fi
 else
   echo "$P"
 fi

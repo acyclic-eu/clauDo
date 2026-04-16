@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Claude launcher — named accounts with per-account config dirs
 #
-# c --add <name>      log in and store an account (browser OAuth)
-# c --list            list accounts (* = default)
-# c --default <name>  set default account
-# c --whoami          show active account + email
-# c --account <name>  use a specific account (persists to .claude-account)
-# c --temp <name>     use account for this session only (no .claude-account written)
-# c [args]            resolve account, set config dir, launch claude
+# c --add|-a <name>      log in and store an account (browser OAuth)
+# c --list|-l            list accounts (* = default)
+# c --default|-d <name>  set default account
+# c --whoami|-w          show active account + email
+# c --account <name>     use a specific account (persists to .claude-account)
+# c --temp|-t <name>     use account for this session only (no .claude-account written)
+# c --statusline|-s      configure ~/.claude/settings.json to use built-in statusline
+# c --remove|-r <name>   remove an account
+# c [account] [args]     resolve account implicitly, set config dir, launch claude
 
 CONF_DIR="$HOME/.config/claude-accounts"
 ACCOUNTS_FILE="$CONF_DIR/accounts"
@@ -47,19 +49,81 @@ _resolve_account() {
   echo "$account"
 }
 
+_run_statusline() {
+  local BOLD='\033[1m'
+  local RED='\033[31m'
+  local RESET='\033[0m'
+
+  # Path (truncated)
+  local P
+  P=$(pwd | sed "s|$HOME|~|")
+  [ ${#P} -gt 40 ] && P="...${P: -37}"
+
+  # Git branch
+  local B
+  B=$(git branch --show-current 2>/dev/null)
+  [ -n "$B" ] && P="${P}[${B}]"
+
+  # Resolve account
+  local ACC=""
+  if [ -n "$C_ACCOUNT" ]; then
+    ACC="$C_ACCOUNT"
+  else
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+      [ -f "$dir/.claude-account" ] && { ACC=$(cat "$dir/.claude-account"); break; }
+      dir=$(dirname "$dir")
+    done
+    [ -z "$ACC" ] && ACC=$(cat "$HOME/.config/claude-accounts/default" 2>/dev/null)
+  fi
+
+  if [ -n "$ACC" ]; then
+    local ACC_CDIR="$HOME/.config/claude-accounts/$ACC"
+    local REAL_CDIR="${CLAUDE_CONFIG_DIR:-$HOME}"
+
+    _get_dom() {
+      python3 -c "
+import json, sys
+try:
+  d = json.load(open('$1/.claude.json'))
+  e = d.get('oauthAccount',{}).get('emailAddress','')
+  dom = e.split('@')[1].split('.')[0] if '@' in e else ''
+  print(dom)
+except: sys.exit(1)
+" 2>/dev/null
+    }
+
+    local ACC_DOM REAL_DOM
+    ACC_DOM=$(_get_dom "$ACC_CDIR")
+    REAL_DOM=$(_get_dom "$REAL_CDIR")
+
+    [ "${C_TEMP:-0}" = "1" ] && local SEP="~/" || local SEP="/"
+
+    if [ -n "$REAL_DOM" ] && [ "$ACC_DOM" != "$REAL_DOM" ]; then
+      echo -e "$P (${ACC}${SEP}${RED}@${REAL_DOM}${RESET})"
+    else
+      local DOM="${ACC_DOM:-${REAL_DOM}}"
+      echo "$P (${ACC}${SEP}@${DOM})"
+    fi
+  else
+    echo "$P"
+  fi
+}
+
 # --- Parse flags ---
 account="" cmd="" passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --add)       cmd=add;     account="$2"; shift 2 ;;
-    --remove)    cmd=remove;  account="$2"; shift 2 ;;
-    --default)   cmd=default; account="$2"; shift 2 ;;
-    --list)      cmd=list;    shift ;;
-    --whoami)    cmd=whoami;  shift ;;
-    --account)   account="$2"; shift 2 ;;
-    --account=*) account="${1#--account=}"; shift ;;
-    --temp)      cmd=temp; account="$2"; shift 2 ;;
-    *)           passthrough+=("$1"); shift ;;
+    --add|-a)     cmd=add;        account="$2"; shift 2 ;;
+    --remove|-r)  cmd=remove;     account="$2"; shift 2 ;;
+    --default|-d) cmd=default;    account="$2"; shift 2 ;;
+    --list|-l)    cmd=list;       shift ;;
+    --whoami|-w)  cmd=whoami;     shift ;;
+    --account)    account="$2";   shift 2 ;;
+    --account=*)  account="${1#--account=}"; shift ;;
+    --temp|-t)    cmd=temp;       account="$2"; shift 2 ;;
+    --statusline|-s) _run_statusline; exit 0 ;;
+    *)            passthrough+=("$1"); shift ;;
   esac
 done
 
@@ -121,6 +185,13 @@ case "$cmd" in
     C_ACCOUNT="$account" C_TEMP=1 CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
     ;;
   *)
+    # Implicit account: c work  →  c --account work
+    if [[ -z "$account" && ${#passthrough[@]} -gt 0 ]]; then
+      first="${passthrough[0]}"
+      grep -qx "$first" "$ACCOUNTS_FILE" 2>/dev/null && {
+        account="$first"; passthrough=("${passthrough[@]:1}")
+      }
+    fi
     [[ -n "$account" ]] && echo "$account" > "$PWD/.claude-account"
     account=$(_resolve_account)
     adir=$(_account_dir "$account")
