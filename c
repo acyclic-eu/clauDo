@@ -2,25 +2,22 @@
 # Claude launcher — named accounts with per-account config dirs
 #
 # c --add|-a <name>      log in and store an account (browser OAuth)
-# c --list|-l            list accounts (* = default)
-# c --default|-d <name>  set default account
+# c --list|-l            list accounts
 # c --whoami|-w          show active account + email
 # c --account <name>     use a specific account (persists to .claude-account)
 # c --temp|-t <name>     use account for this session only (no .claude-account written)
-# c --statusline|-s      configure ~/.claude/settings.json to use built-in statusline
+# c --statusline|-s      print statusline (path, branch, account)
 # c --remove|-r <name>   remove an account
-# c [account] [args]     resolve account implicitly, set config dir, launch claude
+# c [account] [args]     resolve account if set, else use Claude's default
 
 CONF_DIR="$HOME/.config/claude-accounts"
 ACCOUNTS_FILE="$CONF_DIR/accounts"
-DEFAULT_FILE="$CONF_DIR/default"
 
 _account_dir() { echo "$CONF_DIR/$1"; }
 
 _register() {
   mkdir -p "$CONF_DIR"
   grep -qx "$1" "$ACCOUNTS_FILE" 2>/dev/null || echo "$1" >> "$ACCOUNTS_FILE"
-  [[ -f "$DEFAULT_FILE" ]] || echo "$1" > "$DEFAULT_FILE"
 }
 
 _resolve_account() {
@@ -31,14 +28,11 @@ _resolve_account() {
     [[ -f "$dir/.claude-account" ]] && { account=$(< "$dir/.claude-account"); break; }
     dir=$(dirname "$dir")
   done
-  # 2. Global default
-  [[ -z "$account" && -f "$DEFAULT_FILE" ]] && account=$(< "$DEFAULT_FILE")
-  # 3. Prompt
+  # 2. Prompt if multiple accounts and none resolved
   if [[ -z "$account" ]]; then
     mapfile -t accounts < "$ACCOUNTS_FILE" 2>/dev/null
-    (( ${#accounts[@]} == 0 )) && { echo "No accounts. Run: c --add <name>"; exit 1; }
     (( ${#accounts[@]} == 1 )) && account="${accounts[0]}"
-    if [[ -z "$account" ]]; then
+    if [[ -z "$account" && ${#accounts[@]} -gt 1 ]]; then
       if command -v fzf &>/dev/null; then
         account=$(printf '%s\n' "${accounts[@]}" | fzf --prompt="Claude account: " --height=~10)
       else
@@ -50,7 +44,6 @@ _resolve_account() {
 }
 
 _run_statusline() {
-  local BOLD='\033[1m'
   local RED='\033[31m'
   local RESET='\033[0m'
 
@@ -74,7 +67,6 @@ _run_statusline() {
       [ -f "$dir/.claude-account" ] && { ACC=$(cat "$dir/.claude-account"); break; }
       dir=$(dirname "$dir")
     done
-    [ -z "$ACC" ] && ACC=$(cat "$HOME/.config/claude-accounts/default" 2>/dev/null)
   fi
 
   if [ -n "$ACC" ]; then
@@ -114,16 +106,15 @@ except: sys.exit(1)
 account="" cmd="" passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --add|-a)     cmd=add;        account="$2"; shift 2 ;;
-    --remove|-r)  cmd=remove;     account="$2"; shift 2 ;;
-    --default|-d) cmd=default;    account="$2"; shift 2 ;;
-    --list|-l)    cmd=list;       shift ;;
-    --whoami|-w)  cmd=whoami;     shift ;;
-    --account)    account="$2";   shift 2 ;;
-    --account=*)  account="${1#--account=}"; shift ;;
-    --temp|-t)    cmd=temp;       account="$2"; shift 2 ;;
+    --add|-a)        cmd=add;     account="$2"; shift 2 ;;
+    --remove|-r)     cmd=remove;  account="$2"; shift 2 ;;
+    --list|-l)       cmd=list;    shift ;;
+    --whoami|-w)     cmd=whoami;  shift ;;
+    --account)       account="$2"; shift 2 ;;
+    --account=*)     account="${1#--account=}"; shift ;;
+    --temp|-t)       cmd=temp;    account="$2"; shift 2 ;;
     --statusline|-s) _run_statusline; exit 0 ;;
-    *)            passthrough+=("$1"); shift ;;
+    *)               passthrough+=("$1"); shift ;;
   esac
 done
 
@@ -154,18 +145,12 @@ case "$cmd" in
     sed -i '' "/^${account}$/d" "$ACCOUNTS_FILE" 2>/dev/null
     echo "Account '$account' removed."
     ;;
-  default)
-    echo "$account" > "$DEFAULT_FILE"
-    echo "Default set to '$account'."
-    ;;
   list)
-    default=$(< "$DEFAULT_FILE" 2>/dev/null)
-    while IFS= read -r acc; do
-      [[ "$acc" == "$default" ]] && echo "* $acc" || echo "  $acc"
-    done < "$ACCOUNTS_FILE"
+    cat "$ACCOUNTS_FILE" 2>/dev/null
     ;;
   whoami)
     account=$(_resolve_account)
+    [[ -z "$account" ]] && { echo "No account active (Claude default)"; exit 0; }
     adir=$(_account_dir "$account")
     email=$(CLAUDE_CONFIG_DIR="$adir" claude auth status 2>/dev/null \
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('email','unknown'))" 2>/dev/null)
@@ -194,8 +179,12 @@ case "$cmd" in
     fi
     [[ -n "$account" ]] && echo "$account" > "$PWD/.claude-account"
     account=$(_resolve_account)
-    adir=$(_account_dir "$account")
-    [[ ! -d "$adir" ]] && { echo "No config for '$account'. Run: c --add $account"; exit 1; }
-    C_ACCOUNT="$account" CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
+    if [[ -n "$account" ]]; then
+      adir=$(_account_dir "$account")
+      [[ ! -d "$adir" ]] && { echo "No config for '$account'. Run: c --add $account"; exit 1; }
+      C_ACCOUNT="$account" CLAUDE_CONFIG_DIR="$adir" exec claude "${passthrough[@]}"
+    else
+      exec claude "${passthrough[@]}"
+    fi
     ;;
 esac

@@ -21,7 +21,6 @@ else
     [ -f "$dir/.claude-account" ] && { ACC=$(cat "$dir/.claude-account"); break; }
     dir=$(dirname "$dir")
   done
-  [ -z "$ACC" ] && ACC=$(cat "$HOME/.config/claude-accounts/default" 2>/dev/null)
 fi
 
 # Account suffix

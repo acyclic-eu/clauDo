@@ -9,8 +9,8 @@ Claude Code stores its config in `~/.claude/`. clauDo gives each account its own
 Account resolution order:
 1. `c <name>` positional arg or `--account <name>` flag
 2. `.claude-account` file (walks up from current directory)
-3. `~/.config/claude-accounts/default`
-4. Interactive prompt (fzf if available, else `select`)
+3. Interactive prompt if multiple accounts exist (fzf if available, else `select`)
+4. Claude's own default if no account is resolved
 
 ## Usage
 
@@ -19,7 +19,6 @@ c                        # launch Claude with resolved account
 c work                   # implicit account (shorthand for --account work)
 c -a <name>              # register + scaffold a new account (--add)
 c -l                     # list all accounts (* = default) (--list)
-c -d <name>              # set default account (--default)
 c -w                     # print active account's email (--whoami)
 c -t <name>              # use account for this session only (--temp)
 c -r <name>              # remove an account (--remove)
