@@ -7,19 +7,180 @@
 # c --account <name>     use a specific account (persists to .claude-account)
 # c --temp|-t <name>     use account for this session only (no .claude-account written)
 # c --statusline|-s      print statusline (path, branch, account)
+# c --sync-mcp [name]    sync mcpServers for one account (or all if omitted)
 # c --remove|-r <name>   remove an account
 # c [account] [args]     resolve account if set, else use Claude's default
 
 CONF_DIR="$HOME/.config/claude-accounts"
 ACCOUNTS_FILE="$CONF_DIR/accounts"
+CANONICAL_DIR="$HOME/.claude"
 
 _account_dir() { echo "$CONF_DIR/$1"; }
 
-# Sync mcpServers bidirectionally between ~/.claude/.claude.json (canonical) and all profile .claude.json files.
-# Any profile can add servers via /mcp add; they get merged into the canonical on next launch.
-# Record mcpServers into ~/.claude/mcp-history.json (never removes entries).
+# ---------------------------------------------------------------------------
+# Git setup
+# ---------------------------------------------------------------------------
+
+_git_ensure_canonical() {
+  [[ -d "$CANONICAL_DIR/.git" ]] && return
+  git -C "$CANONICAL_DIR" init -q
+  cat > "$CANONICAL_DIR/.gitignore" <<'EOF'
+*
+!.claude.json
+!.gitignore
+EOF
+  git -C "$CANONICAL_DIR" add .claude.json .gitignore 2>/dev/null
+  git -C "$CANONICAL_DIR" commit -q --allow-empty -m "init"
+}
+
+_git_ensure_profile() {
+  local dir="$1"
+  [[ -d "$dir/.git" ]] && return
+  git -C "$dir" init -q
+  cat > "$dir/.gitignore" <<'EOF'
+*
+!.claude.json
+!.mcp-sync
+!.gitignore
+EOF
+  git -C "$dir" add .claude.json .gitignore 2>/dev/null
+  git -C "$dir" commit -q --allow-empty -m "init"
+}
+
+# ---------------------------------------------------------------------------
+# MCP sync
+# ---------------------------------------------------------------------------
+
+_mcp_sync_account() {
+  local account="$1"
+  local adir
+  adir=$(_account_dir "$account")
+  [[ ! -f "$adir/.claude.json" ]] && return
+
+  _git_ensure_canonical
+  _git_ensure_profile "$adir"
+
+  python3 - "$CANONICAL_DIR" "$adir" "$account" <<'PYEOF'
+import json, os, subprocess, sys
+
+canonical_dir = sys.argv[1]
+profile_dir   = sys.argv[2]
+account       = sys.argv[3]
+
+canonical_json = os.path.join(canonical_dir, ".claude.json")
+profile_json   = os.path.join(profile_dir,   ".claude.json")
+mcp_sync_file  = os.path.join(profile_dir,   ".mcp-sync")
+
+def load_mcp(path):
+    try:
+        with open(path) as f: return json.load(f).get("mcpServers", {})
+    except: return {}
+
+def load_json(path):
+    try:
+        with open(path) as f: return json.load(f)
+    except: return {}
+
+def save_json(path, d):
+    with open(path, "w") as f: json.dump(d, f, indent=2)
+
+def git_mcp_at_ref(repo, filepath, ref):
+    rel = os.path.relpath(filepath, repo)
+    r = subprocess.run(["git", "-C", repo, "show", f"{ref}:{rel}"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        try: return json.loads(r.stdout).get("mcpServers", {})
+        except: pass
+    return {}
+
+def git_head(repo):
+    r = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def git_commit(repo, files, message):
+    subprocess.run(["git", "-C", repo, "add"] + files, capture_output=True)
+    r = subprocess.run(["git", "-C", repo, "diff", "--cached", "--quiet"])
+    if r.returncode != 0:
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", message])
+
+def delta(before, after):
+    added   = {k: v for k, v in after.items() if k not in before}
+    changed = {k: v for k, v in after.items() if k in before and v != before[k]}
+    removed = {k for k in before if k not in after}
+    return added, changed, removed
+
+def apply(target, added, changed, removed, skip=None):
+    skip = skip or set()
+    result = dict(target)
+    for k, v in {**added, **changed}.items():
+        if k not in skip: result[k] = v
+    for k in removed:
+        if k not in skip: result.pop(k, None)
+    return result
+
+# Current state
+cur_canonical = load_mcp(canonical_json)
+cur_profile   = load_mcp(profile_json)
+
+# What canonical looked like at last sync (commit hash stored in profile)
+last_hash = None
+if os.path.exists(mcp_sync_file):
+    last_hash = open(mcp_sync_file).read().strip() or None
+
+head_canonical = git_mcp_at_ref(canonical_dir, canonical_json, last_hash) if last_hash else {}
+head_profile   = git_mcp_at_ref(profile_dir,   profile_json,  "HEAD")
+
+# What changed
+can_added, can_changed, can_removed = delta(head_canonical, cur_canonical)
+pro_added, pro_changed, pro_removed = delta(head_profile,   cur_profile)
+
+# Profile wins on conflicts
+profile_touched = set(pro_added) | set(pro_changed) | pro_removed
+
+# Merge
+new_profile   = apply(cur_profile,   can_added, can_changed, can_removed, skip=profile_touched)
+new_canonical = apply(cur_canonical, pro_added, pro_changed, pro_removed)
+
+# Write
+def write_mcp(path, new_mcp):
+    d = load_json(path)
+    d["mcpServers"] = new_mcp
+    save_json(path, d)
+
+write_mcp(profile_json,   new_profile)
+write_mcp(canonical_json, new_canonical)
+
+# Commit canonical, then record its new HEAD in profile
+git_commit(canonical_dir, [".claude.json"], f"sync: {account}")
+new_canonical_head = git_head(canonical_dir)
+if new_canonical_head:
+    with open(mcp_sync_file, "w") as f: f.write(new_canonical_head + "\n")
+
+# Commit profile
+git_commit(profile_dir, [".claude.json", ".mcp-sync"], f"sync: {account}")
+
+# Report
+if can_added or can_changed or can_removed:
+    print(f"  ← canonical: +{list(can_added)} ~{list(can_changed)} -{list(can_removed)}")
+if pro_added or pro_changed or pro_removed:
+    print(f"  → {account}: +{list(pro_added)} ~{list(pro_changed)} -{list(pro_removed)}")
+PYEOF
+}
+
+_mcp_sync_all() {
+  _git_ensure_canonical
+  while IFS= read -r acc; do
+    [[ -n "$acc" ]] && { echo "syncing $acc..."; _mcp_sync_account "$acc"; }
+  done < "$ACCOUNTS_FILE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+
 _mcp_history_update() {
-  local servers_json="$1"   # JSON string of mcpServers dict
+  local servers_json="$1"
   local history="$HOME/.claude/mcp-history.json"
   python3 - "$history" "$servers_json" <<'PYEOF'
 import json, sys
@@ -47,114 +208,9 @@ with open(history_path, "w") as f:
 PYEOF
 }
 
-# Push canonical mcpServers (~/.claude/.claude.json) to all profiles.
-_sync_mcp_push() {
-  local default_json="$HOME/.claude/.claude.json"
-  [[ ! -f "$default_json" ]] && return
-  python3 - "$default_json" "$CONF_DIR" <<'PYEOF'
-import json, os, sys
-
-default_path = sys.argv[1]
-conf_dir     = sys.argv[2]
-
-def load(p):
-  with open(p) as f: return json.load(f)
-def save(p, d):
-  with open(p, "w") as f: json.dump(d, f, indent=2)
-
-canonical = load(default_path).get("mcpServers", {})
-
-accounts_file = os.path.join(conf_dir, "accounts")
-if not os.path.exists(accounts_file):
-  sys.exit(0)
-with open(accounts_file) as f:
-  accounts = [l.strip() for l in f if l.strip()]
-
-for acc in accounts:
-  p = os.path.join(conf_dir, acc, ".claude.json")
-  if not os.path.exists(p): continue
-  d = load(p)
-  if d.get("mcpServers") != canonical:
-    d["mcpServers"] = canonical
-    save(p, d)
-PYEOF
-  # Record current canonical in history
-  local canonical
-  canonical=$(python3 -c "import json; d=json.load(open('$HOME/.claude/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" 2>/dev/null)
-  [[ -n "$canonical" ]] && _mcp_history_update "$canonical"
-}
-
-# After a session ends, diff the active profile's mcpServers against the before-snapshot.
-# Additions and removals are applied to canonical and all other profiles.
-_sync_mcp_diff() {
-  local profile_json="$1"
-  local snapshot="$2"
-  local default_json="$HOME/.claude/.claude.json"
-  [[ ! -f "$profile_json" || ! -f "$snapshot" || ! -f "$default_json" ]] && return
-  python3 - "$profile_json" "$snapshot" "$default_json" "$CONF_DIR" <<'PYEOF'
-import json, os, sys
-
-profile_path  = sys.argv[1]
-snapshot_path = sys.argv[2]
-default_path  = sys.argv[3]
-conf_dir      = sys.argv[4]
-
-def load(p):
-  with open(p) as f: return json.load(f)
-def save(p, d):
-  with open(p, "w") as f: json.dump(d, f, indent=2)
-
-before   = json.loads(open(snapshot_path).read())
-after    = load(profile_path).get("mcpServers", {})
-added    = {k: v for k, v in after.items()   if k not in before}
-removed  = {k     for k    in before.keys()  if k not in after}
-
-if not added and not removed:
-  sys.exit(0)
-
-accounts_file = os.path.join(conf_dir, "accounts")
-with open(accounts_file) as f:
-  accounts = [l.strip() for l in f if l.strip()]
-
-all_paths = [default_path] + [
-  os.path.join(conf_dir, acc, ".claude.json")
-  for acc in accounts
-  if os.path.exists(os.path.join(conf_dir, acc, ".claude.json"))
-]
-
-for p in all_paths:
-  if p == profile_path:
-    continue
-  d = load(p)
-  mcp = dict(d.get("mcpServers", {}))
-  for k, v in added.items():
-    mcp[k] = v
-  for k in removed:
-    mcp.pop(k, None)
-  d["mcpServers"] = mcp
-  save(p, d)
-
-# Also update canonical
-d = load(default_path)
-mcp = dict(d.get("mcpServers", {}))
-for k, v in added.items():
-  mcp[k] = v
-for k in removed:
-  mcp.pop(k, None)
-d["mcpServers"] = mcp
-save(default_path, d)
-
-if added:   print(f"MCP sync: added {list(added.keys())}")
-if removed: print(f"MCP sync: removed {list(removed)}")
-# Output added servers as JSON for history update
-print(f"__added_json__:{json.dumps(added)}")
-PYEOF
-  # Update history with the post-session state (history never removes entries)
-  local after_json
-  after_json=$(python3 -c "import json; d=json.load(open('$profile_json')); print(json.dumps(d.get('mcpServers',{})))" 2>/dev/null)
-  [[ -n "$after_json" ]] && _mcp_history_update "$after_json"
-  rm -f "$snapshot"
-}
+# ---------------------------------------------------------------------------
+# Account helpers
+# ---------------------------------------------------------------------------
 
 _register() {
   mkdir -p "$CONF_DIR"
@@ -163,13 +219,11 @@ _register() {
 
 _resolve_account() {
   local account=""
-  # 1. Walk up for .claude-account
   local dir="$PWD"
   while [[ "$dir" != "/" ]]; do
     [[ -f "$dir/.claude-account" ]] && { account=$(< "$dir/.claude-account"); break; }
     dir=$(dirname "$dir")
   done
-  # 2. Prompt if multiple accounts and none resolved
   if [[ -z "$account" ]]; then
     mapfile -t accounts < "$ACCOUNTS_FILE" 2>/dev/null
     (( ${#accounts[@]} == 1 )) && account="${accounts[0]}"
@@ -184,21 +238,22 @@ _resolve_account() {
   echo "$account"
 }
 
+# ---------------------------------------------------------------------------
+# Statusline
+# ---------------------------------------------------------------------------
+
 _run_statusline() {
   local RED='\033[31m'
   local RESET='\033[0m'
 
-  # Path (truncated)
   local P
   P=$(pwd | sed "s|$HOME|~|")
   [ ${#P} -gt 40 ] && P="...${P: -37}"
 
-  # Git branch
   local B
   B=$(git branch --show-current 2>/dev/null)
   [ -n "$B" ] && P="${P}[${B}]"
 
-  # Resolve account
   local ACC=""
   if [ -n "$C_ACCOUNT" ]; then
     ACC="$C_ACCOUNT"
@@ -243,21 +298,29 @@ except: sys.exit(1)
   fi
 }
 
-# --- Parse flags ---
+# ---------------------------------------------------------------------------
+# Parse flags
+# ---------------------------------------------------------------------------
+
 account="" cmd="" passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --add|-a)        cmd=add;     account="$2"; shift 2 ;;
-    --remove|-r)     cmd=remove;  account="$2"; shift 2 ;;
-    --list|-l)       cmd=list;    shift ;;
-    --whoami|-w)     cmd=whoami;  shift ;;
+    --add|-a)        cmd=add;      account="$2"; shift 2 ;;
+    --remove|-r)     cmd=remove;   account="$2"; shift 2 ;;
+    --list|-l)       cmd=list;     shift ;;
+    --whoami|-w)     cmd=whoami;   shift ;;
     --account)       account="$2"; shift 2 ;;
     --account=*)     account="${1#--account=}"; shift ;;
-    --temp|-t)       cmd=temp;    account="$2"; shift 2 ;;
+    --temp|-t)       cmd=temp;     account="$2"; shift 2 ;;
     --statusline|-s) _run_statusline; exit 0 ;;
+    --sync-mcp)      cmd=sync-mcp; [[ "${2:-}" != -* && -n "${2:-}" ]] && { account="$2"; shift; }; shift ;;
     *)               passthrough+=("$1"); shift ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 
 case "$cmd" in
   add)
@@ -280,17 +343,22 @@ case "$cmd" in
     [[ ! -e "$adir/sessions" ]] && ln -s "$HOME/.claude/sessions" "$adir/sessions"
     CLAUDE_CONFIG_DIR="$adir" claude auth login
     _register "$account"
+    _git_ensure_canonical
+    _git_ensure_profile "$adir"
     echo "Account '$account' ready."
     ;;
+
   remove)
     adir=$(_account_dir "$account")
     rm -rf "$adir"
     sed -i '' "/^${account}$/d" "$ACCOUNTS_FILE" 2>/dev/null
     echo "Account '$account' removed."
     ;;
+
   list)
     cat "$ACCOUNTS_FILE" 2>/dev/null
     ;;
+
   whoami)
     account=$(_resolve_account)
     [[ -z "$account" ]] && { echo "No account active (Claude default)"; exit 0; }
@@ -299,6 +367,7 @@ case "$cmd" in
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('email','unknown'))" 2>/dev/null)
     echo "[$account] $email"
     ;;
+
   temp)
     [[ -z "$account" ]] && { echo "Usage: c --temp <name>"; exit 1; }
     adir=$(_account_dir "$account")
@@ -310,12 +379,19 @@ case "$cmd" in
       [[ ! -e "$adir/plugins" ]] && ln -s "$HOME/.claude/plugins" "$adir/plugins"
       ln -sf "$HOME/.claude/CLAUDE.md" "$adir/CLAUDE.md"
     fi
-    _sync_mcp_push
-    snapshot=$(mktemp)
-    python3 -c "import json; d=json.load(open('$adir/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" > "$snapshot" 2>/dev/null
+    _mcp_sync_account "$account"
     C_ACCOUNT="$account" C_TEMP=1 CLAUDE_CONFIG_DIR="$adir" claude "${passthrough[@]}"
-    _sync_mcp_diff "$adir/.claude.json" "$snapshot"
+    _mcp_sync_account "$account"
     ;;
+
+  sync-mcp)
+    if [[ -n "$account" ]]; then
+      _mcp_sync_account "$account"
+    else
+      _mcp_sync_all
+    fi
+    ;;
+
   *)
     # Implicit account: c work  →  c --account work
     if [[ -z "$account" && ${#passthrough[@]} -gt 0 ]]; then
@@ -329,17 +405,11 @@ case "$cmd" in
     if [[ -n "$account" ]]; then
       adir=$(_account_dir "$account")
       [[ ! -d "$adir" ]] && { echo "No config for '$account'. Run: c --add $account"; exit 1; }
-      _sync_mcp_push
-      snapshot=$(mktemp)
-      python3 -c "import json; d=json.load(open('$adir/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" > "$snapshot" 2>/dev/null
+      _mcp_sync_account "$account"
       C_ACCOUNT="$account" CLAUDE_CONFIG_DIR="$adir" claude "${passthrough[@]}"
-      _sync_mcp_diff "$adir/.claude.json" "$snapshot"
+      _mcp_sync_account "$account"
     else
-      _sync_mcp_push
-      snapshot=$(mktemp)
-      python3 -c "import json; d=json.load(open('$HOME/.claude/.claude.json')); print(json.dumps(d.get('mcpServers',{})))" > "$snapshot" 2>/dev/null
       claude "${passthrough[@]}"
-      _sync_mcp_diff "$HOME/.claude/.claude.json" "$snapshot"
     fi
     ;;
 esac
