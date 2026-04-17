@@ -245,27 +245,40 @@ _resolve_account() {
 _run_statusline() {
   local RED='\033[31m'
   local RESET='\033[0m'
+  local raw_cols="${COLUMNS:-0}"
+  (( raw_cols <= 0 )) && raw_cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}' || tput cols 2>/dev/null || echo 80)
+  (( raw_cols <= 0 )) && raw_cols=80
+  local cols=$(( raw_cols - 20 ))
 
-  local P
-  P=$(pwd | sed "s|$HOME|~|")
-  [ ${#P} -gt 40 ] && P="...${P: -37}"
+  # Path components (prefer cwd from stdin JSON, fall back to pwd)
+  local full_path folder prefix
+  local stdin_cwd
+  stdin_cwd=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('cwd',''))" 2>/dev/null)
+  full_path=$(echo "${stdin_cwd:-$(pwd)}" | sed "s|$HOME|~|")
+  folder=$(basename "$full_path")
+  prefix=$(dirname "$full_path")
+  [[ "$prefix" == "." ]] && prefix="" || prefix="${prefix}/"
 
-  local B
-  B=$(git branch --show-current 2>/dev/null)
-  [ -n "$B" ] && P="${P}[${B}]"
+  # Git branch
+  local branch
+  branch=$(git branch --show-current 2>/dev/null)
+  [[ -n "$branch" ]] && branch="[${branch}]"
 
+  # Account
   local ACC=""
-  if [ -n "$C_ACCOUNT" ]; then
+  if [[ -n "$C_ACCOUNT" ]]; then
     ACC="$C_ACCOUNT"
   else
     local dir="$PWD"
-    while [ "$dir" != "/" ]; do
-      [ -f "$dir/.claude-account" ] && { ACC=$(cat "$dir/.claude-account"); break; }
+    while [[ "$dir" != "/" ]]; do
+      [[ -f "$dir/.claude-account" ]] && { ACC=$(cat "$dir/.claude-account"); break; }
       dir=$(dirname "$dir")
     done
   fi
 
-  if [ -n "$ACC" ]; then
+  # Domain
+  local DOM="" dom_out=""
+  if [[ -n "$ACC" ]]; then
     local ACC_CDIR="$HOME/.config/claude-accounts/$ACC"
     local REAL_CDIR="${CLAUDE_CONFIG_DIR:-$HOME}"
 
@@ -285,16 +298,62 @@ except: sys.exit(1)
     ACC_DOM=$(_get_dom "$ACC_CDIR")
     REAL_DOM=$(_get_dom "$REAL_CDIR")
 
-    [ "${C_TEMP:-0}" = "1" ] && local SEP="~/" || local SEP="/"
-
-    if [ -n "$REAL_DOM" ] && [ "$ACC_DOM" != "$REAL_DOM" ]; then
-      echo -e "$P (${ACC}${SEP}${RED}@${REAL_DOM}${RESET})"
+    if [[ -n "$REAL_DOM" && "$ACC_DOM" != "$REAL_DOM" ]]; then
+      DOM="@${REAL_DOM}"
+      dom_out="@${RED}${REAL_DOM}${RESET}"
     else
-      local DOM="${ACC_DOM:-${REAL_DOM}}"
-      echo "$P (${ACC}${SEP}@${DOM})"
+      DOM="@${ACC_DOM:-${REAL_DOM}}"
+      dom_out="$DOM"
     fi
+  fi
+
+  [[ "${C_TEMP:-0}" = "1" ]] && local SEP="~/" || local SEP="/"
+
+  # Emit the richest line that fits within $cols.
+  # Priority: 1=folder 2=domain 3=branch 4=prefix 5=account
+  _try() {
+    local plain="$1" out="$2"
+    (( ${#plain} <= cols )) && { echo -e "${out}"; return 0; } || return 1
+  }
+
+  local pre_plain pre_out
+  if [[ -n "$DOM" ]]; then
+    pre_plain="(${ACC}${SEP}${DOM}) "
+    pre_out="(${ACC}${SEP}${dom_out}) "
+  fi
+
+  # Emit the richest line that fits within $cols.
+  # Priority: 1=folder 2=domain 3=branch 4=prefix 5=account
+  # Format: (account/@domain) prefix/folder[branch]
+
+  # 5 components
+  _try "${pre_plain}${prefix}${folder}${branch}" \
+       "${pre_out}${prefix}${folder}${branch}" && return
+
+  # Drop account (prio 5)
+  if [[ -n "$ACC" && -n "$DOM" ]]; then
+    _try "(${DOM}) ${prefix}${folder}${branch}" \
+         "(${dom_out}) ${prefix}${folder}${branch}" && return
+  fi
+
+  # Drop prefix (prio 4)
+  if [[ -n "$DOM" ]]; then
+    _try "(${DOM}) ${folder}${branch}" \
+         "(${dom_out}) ${folder}${branch}" && return
   else
-    echo "$P"
+    _try "${folder}${branch}" "${folder}${branch}" && return
+  fi
+
+  # Drop branch (prio 3)
+  if [[ -n "$DOM" ]]; then
+    _try "(${DOM}) ${folder}" "(${dom_out}) ${folder}" && return
+  fi
+
+  # Minimum: domain + folder (or just folder)
+  if [[ -n "$DOM" ]]; then
+    echo -e "(${dom_out}) ${folder}"
+  else
+    echo "${folder}"
   fi
 }
 

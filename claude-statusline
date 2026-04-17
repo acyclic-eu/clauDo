@@ -6,7 +6,6 @@ RESET='\033[0m'
 
 # Path (truncated)
 P=$(pwd | sed "s|$HOME|~|")
-[ ${#P} -gt 40 ] && P="...${P: -37}"
 
 # Git branch
 B=$(git branch --show-current 2>/dev/null)
